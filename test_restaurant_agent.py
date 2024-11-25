@@ -1,6 +1,7 @@
 from uagents import Agent, Bureau, Context, Model
 from datetime import datetime
 import asyncio
+import uuid
 
 # Import the models and agent from your main script
 # Assuming the main script is named restaurant_agent.py
@@ -34,14 +35,16 @@ async def handle_restaurant_response(ctx: Context, sender: str, msg: RestaurantM
     
     ctx.logger.info(f"\n{'='*50}")
 
-@test_agent.on_interval(period=10.0)
+@test_agent.on_interval(period=1000000000000.0)
 async def run_test(ctx: Context):
     """Send a test location request every 10 seconds"""
-    test_location = "Santa Monica, CA"
-    ctx.logger.info(f"\nSending location request: {test_location}")
+    test_location = "Santa Monica"
+    test_user_id = "ac06ccc0-cc01-4f44-b2ee-caaf6656ce87"
+    # test_user_id = str(uuid.uuid4())  # Generate a random user ID for testing
+    ctx.logger.info(f"\nSending location request: {test_location} (User ID: {test_user_id})")
     
     # Send location request to restaurant agent
-    await ctx.send(restaurant_agent.address, LocationMessage(location=test_location))
+    await ctx.send(restaurant_agent.address, LocationMessage(location=test_location, user_id=test_user_id))
 
 # Set up the bureau
 bureau = Bureau()
