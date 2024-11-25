@@ -36,23 +36,22 @@ class Restaurant(Model):
 class LocationMessage(Model):
     """Message model for requesting restaurants in a location"""
     location: str
+    user_id: str  # Added user_id field
 
 class RestaurantMessage(Model):
     """Message model for responding with restaurant information"""
     restaurants: List[Dict]
+    user_id: str  # Added user_id field
 
-# Initialize the agent with these credentials
+# Initialize the agent
 restaurant_agent = Agent(
-    YELP_API_KEY,
-    SUPABASE_URL,
-    SUPABASE_KEY,
     name="restaurant_agent",
     seed="restaurant_agent recovery phrase",
 )
 
 # Store API credentials as agent attributes
 restaurant_agent.yelp_api_key = YELP_API_KEY
-restaurant_agent.supabase_url = SUPABASE_URL
+restaurant_agent.supabase_url = SUPABASE_URL 
 restaurant_agent.supabase_key = SUPABASE_KEY
 restaurant_agent.seen_restaurants = set()
 
@@ -65,12 +64,30 @@ restaurant_agent.supabase = create_client(
 @restaurant_agent.on_message(model=LocationMessage)
 async def handle_location_request(ctx: Context, sender: str, msg: LocationMessage):
     """Handle incoming location requests and respond with restaurant information"""
-    ctx.logger.info(f"Received location request from {sender}: {msg.location}")
+    ctx.logger.info(f"Received location request from {sender} for user {msg.user_id}: {msg.location}")
     
     restaurants = await search_restaurants(ctx, msg.location)
     if restaurants:
-        await store_restaurants(ctx, restaurants)
-        await ctx.send(sender, RestaurantMessage(restaurants=restaurants))
+        # Update user's restaurants_found status and store restaurants data
+        try:
+            # Update the users table
+            restaurant_agent.supabase.table('users').update({
+                'restaurants_found': True,
+                'restaurants': restaurants
+            }).eq('id', msg.user_id).execute()
+            
+            ctx.logger.info(f"Updated user {msg.user_id} with restaurant data")
+            
+            # Also store individual restaurants in the restaurants table
+            await store_restaurants(ctx, restaurants)
+            
+            # Send response back
+            await ctx.send(sender, RestaurantMessage(
+                restaurants=restaurants,
+                user_id=msg.user_id
+            ))
+        except Exception as e:
+            ctx.logger.error(f"Error updating user data: {str(e)}")
     else:
         ctx.logger.error(f"No restaurants found for location: {msg.location}")
 
@@ -80,7 +97,7 @@ async def search_restaurants(ctx: Context, location: str) -> List[Dict]:
     params = {
         'location': location,
         'categories': 'restaurants',
-        'limit': 50,
+        'limit': 30,
         'sort_by': 'rating'
     }
     
@@ -143,22 +160,6 @@ async def store_restaurants(ctx: Context, restaurants: List[Dict]):
                 
         except Exception as e:
             ctx.logger.error(f"Error storing restaurant {business.get('name')}: {str(e)}")
-
-@restaurant_agent.on_interval(period=86400)  # Run daily
-async def scheduled_collection(ctx: Context):
-    """Daily scheduled collection for predefined locations"""
-    locations = [
-        "Los Angeles, CA",
-        "Santa Monica, CA",
-        "Beverly Hills, CA",
-        "Culver City, CA"
-    ]
-    
-    for location in locations:
-        ctx.logger.info(f"Starting scheduled collection for {location}")
-        restaurants = await search_restaurants(ctx, location)
-        if restaurants:
-            await store_restaurants(ctx, restaurants)
 
 # Bureau setup for running the agent
 bureau = Bureau()
