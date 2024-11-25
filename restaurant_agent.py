@@ -53,7 +53,7 @@ restaurant_agent = Agent(
 async def handle_location_request(ctx: Context, sender: str, msg: LocationMessage):
     """Handle incoming location requests and respond with restaurant information"""
     ctx.logger.info(f"Received location request from {sender} for user {msg.user_id}: {msg.location}")
-    
+    print(f"Agent Address: {restaurant_agent.address}")    
     restaurants = await search_restaurants(ctx, msg.location)
     if restaurants:
         try:
