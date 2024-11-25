@@ -1,10 +1,19 @@
+from uagents import Agent, Bureau, Context, Model
 from typing import List, Dict, Any
-from fetchai.uagents import Agent, Context, Model
-from fetchai.uagents.config import DEFAULT_ENDPOINTS
-import requests
+import aiohttp
 from supabase import create_client, Client
 from pydantic import BaseModel
 from datetime import datetime
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
+
+# Get environment variables
+YELP_API_KEY = os.getenv('YELP_API_KEY')
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 
 # Data Models
 class Restaurant(Model):
@@ -24,177 +33,142 @@ class Restaurant(Model):
     created_at: str = datetime.now().isoformat()
     updated_at: str = datetime.now().isoformat()
 
-class YelpRestaurantAgent(Agent):
-    def __init__(self, name: str, yelp_api_key: str, supabase_url: str, supabase_key: str):
-        super().__init__(name=name, endpoint=DEFAULT_ENDPOINTS["default"])
-        
-        # Initialize Yelp API settings
-        self.api_key = yelp_api_key
-        self.headers = {'Authorization': f'Bearer {self.api_key}'}
-        self.yelp_base_url = 'https://api.yelp.com/v3/businesses'
-        
-        # Initialize Supabase
-        self.supabase: Client = create_client(supabase_url, supabase_key)
-        
-        # Track seen restaurants to avoid duplicates
-        self.seen_restaurants = set()
+class LocationMessage(Model):
+    """Message model for requesting restaurants in a location"""
+    location: str
 
-    async def clear_restaurants(self, ctx: Context):
-        """Clear existing restaurants table"""
-        try:
-            self.supabase.table('restaurants').delete().execute()
-            ctx.logger.info("Cleared existing restaurants")
-        except Exception as e:
-            ctx.logger.error(f"Error clearing restaurants: {str(e)}")
+class RestaurantMessage(Model):
+    """Message model for responding with restaurant information"""
+    restaurants: List[Dict]
 
-    async def search_restaurants(self, ctx: Context, location: str) -> List[Dict]:
-        """Search for restaurants in a given location using Yelp API"""
-        try:
-            params = {
-                'location': location,
-                'categories': 'restaurants',
-                'limit': 50,  # Maximum allowed by Yelp
-                'sort_by': 'rating'
-            }
-            
-            response = requests.get(
-                f'{self.yelp_base_url}/search',
-                headers=self.headers,
-                params=params
-            )
-            response.raise_for_status()
-            return response.json().get('businesses', [])
-        except Exception as e:
-            ctx.logger.error(f"Error searching restaurants: {str(e)}")
-            return []
+# Initialize the restaurant agent
+restaurant_agent = Agent(
+    name="restaurant_agent",
+    seed="restaurant_agent recovery phrase"
+)
 
-    def transform_to_restaurant(self, business: Dict) -> Dict:
-        """Transform Yelp business data into our Restaurant model"""
-        cuisines = [cat['title'] for cat in business.get('categories', [])]
-        
-        return {
-            "name": business['name'].replace("/", " "),
-            "location": [
-                business['coordinates']['latitude'],
-                business['coordinates']['longitude']
-            ],
-            "address": ', '.join(business['location'].get('display_address', [])),
-            "link": business.get('url'),
-            "cuisine": cuisines,
-            "main_cuisine": cuisines[0] if cuisines else "Unknown",
-            "phone": business.get('phone'),
-            "rating": business.get('rating'),
-            "price": business.get('price'),
-            "image_url": business.get('image_url'),
-            "review_count": business.get('review_count'),
-            "transactions": business.get('transactions', []),
-            "yelp_id": business.get('id'),
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat()
-        }
+# Initialize the agent with these credentials
+agent = Agent(
+    YELP_API_KEY,
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    name="restaurant_agent",
+    seed="restaurant_agent recovery phrase",
+)
 
-    async def collect_restaurants(self, ctx: Context, location: str):
-        """Collect restaurants for a specific location"""
-        ctx.logger.info(f"Starting restaurant collection for {location}")
-        
-        # Get restaurants from Yelp
-        restaurants = await self.search_restaurants(ctx, location)
-        
-        for business in restaurants:
-            try:
-                if business['id'] not in self.seen_restaurants:
-                    self.seen_restaurants.add(business['id'])
-                    
-                    # Transform restaurant data
-                    restaurant_data = self.transform_to_restaurant(business)
-                    
-                    # Store in Supabase
-                    result = self.supabase.table('restaurants').upsert(
-                        restaurant_data,
-                        on_conflict='yelp_id'  # Assuming you have a unique constraint on yelp_id
-                    ).execute()
-                    
-                    ctx.logger.info(f"Stored restaurant: {restaurant_data['name']}")
-                    
-            except Exception as e:
-                ctx.logger.error(f"Error processing restaurant {business.get('name')}: {str(e)}")
-        
-        ctx.logger.info(f"Completed collecting restaurants for {location}")
+# Store API credentials as agent attributes
+restaurant_agent.yelp_api_key = YELP_API_KEY
+restaurant_agent.supabase_url = SUPABASE_URL
+restaurant_agent.supabase_key = SUPABASE_KEY
+restaurant_agent.seen_restaurants = set()
 
-    @Agent.on_interval(period=86400)  # Run daily
-    async def scheduled_collection(self, ctx: Context):
-        """Daily scheduled collection for predefined locations"""
-        locations = [
-            "Los Angeles, CA",
-            "Santa Monica, CA",
-            "Beverly Hills, CA",
-            "Culver City, CA"
-        ]
-        
-        for location in locations:
-            await self.collect_restaurants(ctx, location)
+# Initialize Supabase client
+restaurant_agent.supabase = create_client(
+    restaurant_agent.supabase_url,
+    restaurant_agent.supabase_key
+)
 
-# Testing script
-async def test_agent(yelp_api_key: str, supabase_url: str, supabase_key: str):
-    """Test the restaurant agent"""
-    print("\nTesting Restaurant Agent...")
+@restaurant_agent.on_message(model=LocationMessage)
+async def handle_location_request(ctx: Context, sender: str, msg: LocationMessage):
+    """Handle incoming location requests and respond with restaurant information"""
+    ctx.logger.info(f"Received location request from {sender}: {msg.location}")
+    
+    restaurants = await search_restaurants(ctx, msg.location)
+    if restaurants:
+        await store_restaurants(ctx, restaurants)
+        await ctx.send(sender, RestaurantMessage(restaurants=restaurants))
+    else:
+        ctx.logger.error(f"No restaurants found for location: {msg.location}")
+
+async def search_restaurants(ctx: Context, location: str) -> List[Dict]:
+    """Search for restaurants using Yelp API"""
+    headers = {'Authorization': f'Bearer {restaurant_agent.yelp_api_key}'}
+    params = {
+        'location': location,
+        'categories': 'restaurants',
+        'limit': 50,
+        'sort_by': 'rating'
+    }
     
     try:
-        # Create agent
-        agent = YelpRestaurantAgent(
-            "test_agent",
-            yelp_api_key,
-            supabase_url,
-            supabase_key
-        )
-        
-        # Test location
-        test_location = "Santa Monica, CA"
-        
-        print("\nTesting Yelp API connection...")
-        restaurants = await agent.search_restaurants(agent.context, test_location)
-        if restaurants:
-            print(f"✅ Successfully retrieved {len(restaurants)} restaurants")
-        else:
-            print("❌ Failed to retrieve restaurants")
-            return
-        
-        print("\nTesting Supabase connection...")
-        try:
-            # Test query
-            result = agent.supabase.table('restaurants').select("*").limit(1).execute()
-            print("✅ Successfully connected to Supabase")
-        except Exception as e:
-            print(f"❌ Supabase connection failed: {str(e)}")
-            return
-        
-        print("\nTesting data collection...")
-        await agent.collect_restaurants(agent.context, test_location)
-        
-        # Verify data in Supabase
-        result = agent.supabase.table('restaurants').select("*").execute()
-        count = len(result.data)
-        print(f"✅ Successfully stored {count} restaurants in Supabase")
-        
-        if count > 0:
-            sample = result.data[0]
-            print("\nSample restaurant data:")
-            print(f"Name: {sample['name']}")
-            print(f"Cuisine: {sample['main_cuisine']}")
-            print(f"Rating: {sample['rating']}")
-            print(f"Address: {sample['address']}")
-        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                'https://api.yelp.com/v3/businesses/search',
+                headers=headers,
+                params=params
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('businesses', [])
+                else:
+                    ctx.logger.error(f"Yelp API error: {response.status}")
+                    return []
     except Exception as e:
-        print(f"❌ Test failed: {str(e)}")
+        ctx.logger.error(f"Error searching restaurants: {str(e)}")
+        return []
 
-# Example usage
+def transform_to_restaurant(business: Dict) -> Dict:
+    """Transform Yelp business data into Restaurant model format"""
+    cuisines = [cat['title'] for cat in business.get('categories', [])]
+    
+    return {
+        "name": business['name'].replace("/", " "),
+        "location": [
+            business['coordinates']['latitude'],
+            business['coordinates']['longitude']
+        ],
+        "address": ', '.join(business['location'].get('display_address', [])),
+        "link": business.get('url'),
+        "cuisine": cuisines,
+        "main_cuisine": cuisines[0] if cuisines else "Unknown",
+        "phone": business.get('phone'),
+        "rating": business.get('rating'),
+        "price": business.get('price'),
+        "image_url": business.get('image_url'),
+        "review_count": business.get('review_count'),
+        "transactions": business.get('transactions', []),
+        "yelp_id": business.get('id'),
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat()
+    }
+
+async def store_restaurants(ctx: Context, restaurants: List[Dict]):
+    """Store restaurants in Supabase database"""
+    for business in restaurants:
+        try:
+            if business['id'] not in restaurant_agent.seen_restaurants:
+                restaurant_agent.seen_restaurants.add(business['id'])
+                restaurant_data = transform_to_restaurant(business)
+                
+                result = restaurant_agent.supabase.table('restaurants').upsert(
+                    restaurant_data,
+                    on_conflict='yelp_id'
+                ).execute()
+                
+                ctx.logger.info(f"Stored restaurant: {restaurant_data['name']}")
+                
+        except Exception as e:
+            ctx.logger.error(f"Error storing restaurant {business.get('name')}: {str(e)}")
+
+@restaurant_agent.on_interval(period=86400)  # Run daily
+async def scheduled_collection(ctx: Context):
+    """Daily scheduled collection for predefined locations"""
+    locations = [
+        "Los Angeles, CA",
+        "Santa Monica, CA",
+        "Beverly Hills, CA",
+        "Culver City, CA"
+    ]
+    
+    for location in locations:
+        ctx.logger.info(f"Starting scheduled collection for {location}")
+        restaurants = await search_restaurants(ctx, location)
+        if restaurants:
+            await store_restaurants(ctx, restaurants)
+
+# Bureau setup for running the agent
+bureau = Bureau()
+bureau.add(restaurant_agent)
+
 if __name__ == "__main__":
-    import asyncio
-    
-    # Your credentials
-    YELP_API_KEY = "your_yelp_api_key_here"
-    SUPABASE_URL = "your_supabase_url_here"
-    SUPABASE_KEY = "your_supabase_key_here"
-    
-    # Run tests
-    asyncio.run(test_agent(YELP_API_KEY, SUPABASE_URL, SUPABASE_KEY))
+    bureau.run()
